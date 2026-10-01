@@ -1,0 +1,11 @@
+# BuildKit reads this file for deploy/Dockerfile (instead of a root .dockerignore,
+# which would collide with upstream). .env MUST stay out of the image.
+.git
+.env
+.env.*
+!.env.example
+node_modules
+dist
+.gev-cache
+.gev-logs
+docs/media

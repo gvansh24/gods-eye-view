@@ -1,0 +1,51 @@
+name: Deploy to Oracle (live)
+
+# Only the `live` branch deploys. `main` mirrors upstream (GitHub "Sync fork");
+# promote it with: git merge upstream/main into live, then push live.
+on:
+  push:
+    branches:
+      - live
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-oracle
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Never run in upstream or in other forks that copy this file.
+    if: github.repository == 'gvansh24/gods-eye-view'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # First build of Cesium on 2 ARM cores takes a while.
+          command_timeout: 40m
+          script: |
+            set -e
+
+            cd ~/server/gods-eye-view
+            git fetch origin live
+            git checkout -q live
+            git merge --ff-only origin/live
+
+            # Build + (re)start; .env holds keys and is read for build args too.
+            sudo docker compose -f deploy/docker-compose.yml --env-file .env up -d --build
+            sudo docker image prune -f
+
+            # Smoke test through the gateway: page, plus two local /api routes
+            # (no upstream calls) so a broken provider mount fails the run.
+            for i in $(seq 1 30); do
+              curl -fsS -o /dev/null http://127.0.0.1:8080/ && break
+              sleep 3
+            done
+            curl -fsS -o /dev/null http://127.0.0.1:8080/
+            curl -fsS -o /dev/null http://127.0.0.1:8080/api/firms/status
+            curl -fsS -o /dev/null http://127.0.0.1:8080/api/tomtom/status
+            echo "deployed $(git rev-parse --short HEAD)"
