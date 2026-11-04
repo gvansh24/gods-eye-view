@@ -32,15 +32,28 @@ git push origin live
 cd ~/server
 git clone -b live https://github.com/gvansh24/gods-eye-view.git
 cd gods-eye-view
-cp deploy/env.example .env && chmod 600 .env   # then add GOOGLE_MAPS_API_KEY
+cp deploy/env.example .env && chmod 600 .env   # keys are optional; see the comments in it
 sudo docker compose -f deploy/docker-compose.yml --env-file .env up -d --build
 ```
 
 The OCI security list must allow ingress TCP 8080. Host iptables needs no change:
 Docker's FORWARD rules handle published ports.
 
+## Why not upstream's Dockerfile
+
+Upstream's root `Dockerfile` and `compose.yaml` run the dev server and trust the
+container gateway for Provider Settings, which is only safe on loopback. `deploy/Dockerfile`
+serves the production build with `vite preview`, where that panel is not registered.
+
+## Why the gateway headers matter
+
+`servers/gods-eye-view.conf` must send `Host $http_host` (with the port) or the same-site
+gate returns 403 on terrain. The forwarding headers make upstream's gate refuse routes
+that spend keys (Places, TomTom, OpenAI, Gemini), so those features stay off here. The
+deploy workflow's smoke test fails if either behaviour changes.
+
 ## Why a separate port
 
-The app hard-codes root paths (`/api/...`, `/models/...`, `/logo.svg`) and never uses
-Vite's `base`, so it must be served at `/`. When a domain exists, change only
-`listen`/`server_name` in the gateway's `servers/gods-eye-view.conf`.
+The app hard-codes root paths (`/api/...`, `/models/...`, `/logo.svg`), so it must be
+served at `/`. When a domain exists, change `listen`/`server_name` in the gateway's
+`servers/gods-eye-view.conf` and add the name to `GEV_ALLOWED_HOSTS` in `.env`.

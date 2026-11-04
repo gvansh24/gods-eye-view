@@ -39,13 +39,21 @@ jobs:
             sudo docker compose -f deploy/docker-compose.yml --env-file .env up -d --build
             sudo docker image prune -f
 
-            # Smoke test through the gateway: page, plus two local /api routes
-            # (no upstream calls) so a broken provider mount fails the run.
+            # Smoke test through the gateway, with no upstream calls.
             for i in $(seq 1 30); do
               curl -fsS -o /dev/null http://127.0.0.1:8080/ && break
               sleep 3
             done
             curl -fsS -o /dev/null http://127.0.0.1:8080/
             curl -fsS -o /dev/null http://127.0.0.1:8080/api/firms/status
-            curl -fsS -o /dev/null http://127.0.0.1:8080/api/tomtom/status
+
+            # 400 = reached validation. 403 means the gateway stopped passing the
+            # original Host, which breaks terrain for every visitor.
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: http://127.0.0.1:8080' http://127.0.0.1:8080/api/terrain/heights)
+            test "$code" = 400
+
+            # Spend-bearing routes must stay refused while the instance is public.
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/realtime/token)
+            test "$code" = 403
+
             echo "deployed $(git rev-parse --short HEAD)"
