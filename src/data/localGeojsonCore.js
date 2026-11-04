@@ -1,4 +1,9 @@
 import * as Cesium from 'cesium';
+import {
+  layerTitle,
+  mapAnalystRecord,
+  parseGeojsonLines,
+} from '../sources/infrastructureData.js';
 import { createInfrastructureOverlayEntry } from './infrastructureOverlayEntry.js';
 import { isPointerFree } from './inputOwnership.js';
 import {
@@ -84,78 +89,6 @@ export function localInfrastructureOverlayCopy(properties, layerId) {
   }
 
   return { title, details };
-}
-
-/**
- * Map one local infrastructure feature to a JSON-safe analyst record
- * (analyst query engine seam). Pure — no Cesium types. Missing/unknown
- * fields are null, never NaN/undefined. Layer-specific fields that do not
- * apply (river/output on datacenters, capacity on dams) stay null so a
- * shared compact payload can copy them without inventing values.
- * Names are unclamped — overlay cards shorten for paint; queries need the
- * full source string ("Usina Hidrelétrica de Itaipu").
- * @param {Object|null|undefined} raw - {id, lat, lon, properties}.
- * @param {string} [layerId] Local layer id (`local-datacenters` / `local-dams`).
- * @returns {{id: string, name: string|null, lat: number|null, lon: number|null,
- *   operator: string|null, capacity: string|null, river: string|null,
- *   output: string|null}}
- */
-export function mapAnalystRecord(raw, layerId = '') {
-  const num = (v) => (Number.isFinite(v) ? v : null);
-  const text = (v) => {
-    const t = String(v ?? '').trim();
-    return t && t !== 'undefined' && t !== 'null' ? t : null;
-  };
-  const props =
-    raw?.properties &&
-    typeof raw.properties === 'object' &&
-    !Array.isArray(raw.properties)
-      ? raw.properties
-      : {};
-  const tags =
-    props.tags && typeof props.tags === 'object' && !Array.isArray(props.tags)
-      ? props.tags
-      : {};
-  const name =
-    text(props.name) ||
-    text(tags.name) ||
-    text(tags['name:en']) ||
-    text(tags.official_name) ||
-    null;
-  const operator =
-    text(tags.operator) ||
-    text(props.operator) ||
-    text(tags['operator:short']) ||
-    null;
-  const capacity =
-    layerId === 'local-datacenters'
-      ? text(tags['capacity:it_load']) ||
-        text(tags.it_load) ||
-        text(tags.capacity) ||
-        text(props.capacity)
-      : null;
-  const river =
-    layerId === 'local-dams'
-      ? text(tags.associated_river) ||
-        text(props.associated_river) ||
-        text(tags.river) ||
-        text(props.river) ||
-        text(tags['river:name'])
-      : null;
-  const output =
-    layerId === 'local-dams'
-      ? text(props.output) || text(tags['plant:output:electricity'])
-      : null;
-  return {
-    id: name || text(raw?.id) || layerTitle(layerId),
-    name,
-    lat: num(raw?.lat),
-    lon: num(raw?.lon),
-    operator,
-    capacity,
-    river,
-    output,
-  };
 }
 
 /**
@@ -664,11 +597,7 @@ export function createLocalGeoJsonLayer(
                 }
                 const text = await response.text();
                 if (_destroyed) return;
-                const lines = text
-                  .split('\n')
-                  .filter((l) => l.trim().length > 0);
-
-                features = lines.map((line) => JSON.parse(line));
+                features = parseGeojsonLines(text);
                 _cachedFeatures = features;
               }
 
@@ -1071,9 +1000,9 @@ export function createLocalGeoJsonLayer(
             // governor the retry's preRender never arrives on a parked camera
             // and the stem stays at ellipsoid height (buried/floating) until
             // the user happens to move. Schedule the frame the retry needs.
-            // Gated on a sampleable scene and in-range records only, so a far
-            // camera (or a keyless scene) stays fully idle; the distance is
-            // only computed for still-unsampled stems.
+            // Gated on a sampleable scene and in-range, in-view records only,
+            // so a far camera (or a keyless scene) stays fully idle; the
+            // distance is only computed for still-unsampled stems.
             if (
               canSampleGround &&
               !record.groundSampled &&
@@ -1081,7 +1010,8 @@ export function createLocalGeoJsonLayer(
               Cesium.Cartesian3.distance(
                 viewer.camera.positionWC,
                 record.base,
-              ) < GROUND_SAMPLE_MAX_DISTANCE_M
+              ) < GROUND_SAMPLE_MAX_DISTANCE_M &&
+              groundSampleInView(viewer, record)
             ) {
               groundRetryPending = true;
             }
@@ -1201,9 +1131,87 @@ function refreshLocalTerrainFloor(viewer, record) {
   return true;
 }
 
+const groundSampleOccluder = new Cesium.EllipsoidalOccluder(
+  Cesium.Ellipsoid.WGS84,
+);
+
+const groundSampleCarto = new Cesium.Cartographic();
+const groundSampleLow = new Cesium.Cartesian3();
+const groundSampleHigh = new Cesium.Cartesian3();
+
+/** The record's vertical at `height` metres above the ellipsoid. */
+function groundSamplePoint(record, height, result) {
+  groundSampleCarto.longitude = record.carto.longitude;
+  groundSampleCarto.latitude = record.carto.latitude;
+  groundSampleCarto.height = height;
+  return Cesium.Cartographic.toCartesian(
+    groundSampleCarto,
+    Cesium.Ellipsoid.WGS84,
+    result,
+  );
+}
+
+/**
+ * Whether the camera can see the ground under the record: inside the view
+ * frustum and above the horizon. scene.sampleHeight reads only surface
+ * rendered for the current view, so a sample of unseen ground passes through
+ * the Earth (about -6,344 km near Ashburn on Esri) and fails on every 2 s
+ * retry, each one a full offscreen render; 110 unseen data centres there held
+ * rest frames at 58-589 ms. Unsampled bases sit on the ellipsoid, so the test
+ * uses loaded globe terrain when there is some. Otherwise (a hidden globe) it
+ * tests the vertical across +/-GROUND_SAMPLE_MAX_ABS_HEIGHT_M, every height a
+ * sample can accept, so high or below-ellipsoid ground in view is never
+ * mistaken for an unseen base. Unseen ground is sampled on the first walk that
+ * sees it.
+ */
+function groundSampleInView(viewer, record) {
+  const camera = viewer.camera;
+  const globe = viewer.scene.globe;
+  const terrain = globe?.show ? globe.getHeight?.(record.carto) : undefined;
+  const known =
+    Number.isFinite(terrain) &&
+    Math.abs(terrain) <= GROUND_SAMPLE_MAX_ABS_HEIGHT_M;
+  const low = groundSamplePoint(
+    record,
+    known ? terrain : -GROUND_SAMPLE_MAX_ABS_HEIGHT_M,
+    groundSampleLow,
+  );
+  const high = known
+    ? low
+    : groundSamplePoint(
+        record,
+        GROUND_SAMPLE_MAX_ABS_HEIGHT_M,
+        groundSampleHigh,
+      );
+  // The vertical is unseen only when both ends are outside the same plane.
+  const { planes } = camera.frustum.computeCullingVolume(
+    camera.positionWC,
+    camera.directionWC,
+    camera.upWC,
+  );
+  for (const plane of planes) {
+    if (
+      Cesium.Cartesian3.dot(plane, low) + plane.w < 0 &&
+      Cesium.Cartesian3.dot(plane, high) + plane.w < 0
+    )
+      return false;
+  }
+  // The ellipsoidal occluder hides every point below the ellipsoid from a
+  // camera near it, so ground below 0 m (low-geoid coasts, the Dead Sea) is
+  // tested at 0 m; unknown ground at the top of the vertical.
+  const horizonHeight = known
+    ? Math.max(terrain, 0)
+    : GROUND_SAMPLE_MAX_ABS_HEIGHT_M;
+  groundSampleOccluder.cameraPosition = camera.positionWC;
+  return groundSampleOccluder.isPointVisible(
+    groundSamplePoint(record, horizonHeight, groundSampleHigh),
+  );
+}
+
 function sampleLocalGroundHeight(viewer, record, now) {
   if (record.groundSampled || !viewer.scene.sampleHeightSupported) return false;
   if (now - record.lastGroundSampleMs < GROUND_SAMPLE_RETRY_MS) return false;
+  if (!groundSampleInView(viewer, record)) return false;
   record.lastGroundSampleMs = now;
   const globe = viewer.scene.globe;
   if (globe?.show && globe.tilesLoaded === false) return false;
@@ -1360,8 +1368,4 @@ function clampCardLine(value) {
   return text.length > 48 ? `${text.slice(0, 45)}...` : text;
 }
 
-function layerTitle(layerId) {
-  if (layerId === 'local-datacenters') return 'Datacenter';
-  if (layerId === 'local-dams') return 'Dam';
-  return 'Feature';
-}
+export { mapAnalystRecord };
