@@ -57,3 +57,9 @@ deploy workflow's smoke test fails if either behaviour changes.
 The app hard-codes root paths (`/api/...`, `/models/...`, `/logo.svg`), so it must be
 served at `/`. When a domain exists, change `listen`/`server_name` in the gateway's
 `servers/gods-eye-view.conf` and add the name to `GEV_ALLOWED_HOSTS` in `.env`.
+
+## Redeploying without a code change
+
+The "Run workflow" button (and `gh workflow run`) does not work in this fork: GitHub only
+offers it for workflows on the default branch, and `main` stays a pure upstream mirror.
+Push to `live` instead, e.g. `git commit --allow-empty -m "deploy: redeploy" && git push origin live`.
